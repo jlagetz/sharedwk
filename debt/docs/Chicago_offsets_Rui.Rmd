@@ -1,0 +1,260 @@
+---
+title: "Chicago offsets"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE, cache=F}
+knitr::opts_chunk$set(echo = TRUE, error = TRUE)
+```
+This includes all the steps that we did to process the data, the last section is the regressions, but there may be some interesting tidbits along the way. I'm happy to go over this with anyone. I even have a song out regression.
+
+We want to use TidyCensus to grab the following sets of variables for Illinois:<br>
+
+B03002... - population and race by Hispanic origin variables<br>
+B19013_001  - median income<br>
+B17020_001 - poverty population<br>
+B17020_002 - below poverty<br>
+
+We created a list (aka vector) with the variables and grabbed the data from the 2019 5-year ACS for all the ZIP code tabulation areas in Illinois:
+```{r}
+load("jlworking.RData")
+library(tidycensus)
+ilvars <- c("B03002_001", "B03002_002", "B03002_003", "B03002_004", "B03002_005", "B03002_006", "B03002_007", "B03002_008","B03002_009", "B03002_012","B19013_001","B17020_001","B17020_002")
+
+
+ilzcta <- get_acs(geography = "zcta", 
+              variables = ilvars,
+              state = "IL", 
+              year = 2019)
+
+head(ilzcta)
+```
+
+Because the data comes from TidyCensus in a long list, we pivot_wider to put the data into columns:
+
+```{r echo=FALSE}
+load("jlworking.RData")
+library(tidycensus)
+library(tidyverse)
+
+wide_il <- ilzcta %>%
+  pivot_wider(names_from = variable, values_from = c(estimate, moe))
+
+head(wide_il)
+```
+
+We still have the table names from the ACS, so we can use rename to make them readable, using the rename function:
+```{r}
+pretty_il <- wide_il %>% rename(pop = estimate_B03002_001) %>% 
+            rename(not_hisp = estimate_B03002_002) %>% 
+            rename(white = estimate_B03002_003) %>% 
+            rename(black = estimate_B03002_004) %>% 
+            rename(am_ind = estimate_B03002_005) %>%
+            rename(asian = estimate_B03002_006) %>%
+            rename(pac_isl = estimate_B03002_007) %>% 
+            rename(other = estimate_B03002_008) %>% 
+            rename(mult = estimate_B03002_009) %>% 
+            rename(hisp = estimate_B03002_012) %>% 
+            rename(medinc = estimate_B19013_001) %>% 
+            rename(povpop = estimate_B17020_001) %>% 
+            rename(pov = estimate_B17020_002) 
+
+head(pretty_il)
+```
+
+ACS data includes the **margin of error**. These are especially important when doing rankings as they could change where a particular geography ranks. In this case, we're going to just pull out the estimate columns. We also can rename in this step.
+
+```{r}
+pretty_il2 <- pretty_il %>% select(1:15)
+head(pretty_il2)
+```
+
+**Rates and percentages**
+
+We typically want to compare rates or percentages rather than raw numbers. We can use the mutate command to do these calculations:
+
+```{r}
+fin_il<-pretty_il2 %>% mutate(pct_white=100*(white/pop)) %>% 
+               mutate(pct_black=100*(black/pop)) %>% 
+               mutate(pct_am_ind=100*(am_ind/pop)) %>% 
+               mutate(pct_asian=100*(asian/pop)) %>% 
+               mutate(pct_pac_isl=100*(pac_isl/pop)) %>% 
+               mutate(pct_other=100*(other/pop)) %>% 
+               mutate(pct_mult=100*(mult/pop)) %>% 
+               mutate(pct_hisp=100*(hisp/pop)) %>% 
+               mutate(pct_pov=100*(pov/povpop))
+
+
+fin_il<- fin_il %>% mutate(across(16:24,round,1)) #round everything to 1 decimal point
+head(fin_il)
+
+```
+
+
+##Illinois garnishment data
+
+We read in the garnishment data from Illinois and do some cleanup. 
+```{r}
+il_debt<- read_csv('il_debt.csv', col_names = TRUE )
+
+il_debt<-il_debt %>% select(1:7) #pull off first 7 columns
+il_debt<- il_debt %>% drop_na(offset_count) #get rid of blank lines
+il_debt<- il_debt %>% filter(debtcode != "TOTALS") #get rid of the total line
+
+head(il_debt)
+```
+
+We can explore the data using count and summarise. Think of dplyr as R's answer to SQL. Consider all the waYs that the data might be messed up.
+
+Aggregate ZIPs and states and then check for ZIPs that appear in multiple states:
+```{r}
+zips<- il_debt %>% count(zip,state)
+head(zips)
+
+zip_check<- zips %>% count(zip)
+head(zip_check)
+```
+zip 62269 shows up in MO and IL - is that ok?
+
+More exploration: Do numbers total what they should? Is there anything you can compare this to?
+
+```{r}
+
+il_debt %>%
+  summarise(sumoffsets = sum(offset_count), sumamt=sum(offset_amt),n = n()) %>% 
+  arrange(desc(sumoffsets))
+
+
+il_debt %>%
+  group_by(zip) %>%
+  summarise(sumoffsets = sum(offset_count), sumamt=sum(offset_amt),n = n()) %>% 
+  arrange(desc(sumoffsets))
+  
+il_zips<- il_debt %>%
+  filter(state == "IL",zip > '00000') %>%
+  group_by(zip,state) %>%
+  summarise(n = n()) %>% 
+  arrange(zip)
+  
+il_debt %>% count(debtcode)
+
+```
+
+Because this data includes ZIPs across the country, we pull out just the IL records and valid ZIPs:
+
+```{r}
+il_debt2<- il_debt %>% filter(state == "IL",zip > '00000') %>% 
+    group_by(zip) %>% 
+    summarise(sumoffsets = sum(offset_count), sumamt=sum(offset_amt),n = n()) %>% 
+    arrange(desc(sumoffsets))
+
+```
+
+##JOINING DATA
+
+
+We have two data sets: il_debt and fin_il. In structuring the join, think about what table is the "master" and what table is the "lookup" or helper table to add more data.  Our master table is il_debt. We'll do a left join so we keep everything in the debt table and join only those matches from the census data.  If both fields were named the same, we could simply do:
+
+il_debt_census<- ildebt %>% 
+    left_join(fin_il, by="zip")
+    
+But we have different field names, so we need to tweak the join a bit:
+
+```
+il_debt_census<- left_join(il_debt2, fin_il, by = c("zip" = "GEOID"))
+```
+
+We add a column to calculate offsets and amout by population to create rates, then round.
+```
+il_debt_census2<- il_debt_census %>% mutate(offset_rate=(sumoffsets/pop*10000)) %>% 
+               mutate(amt_rate=(sumamt/pop*10000))
+
+il_debt_census_fin<- il_debt_census2 %>% mutate(across(28:29,round,1)) #round everything to 1 decimal point
+```
+
+Pull out Chicago ZIPs by importing table of Chicago ZIPs and joining to the main table using an "inner join" to just capture those things that matched. This step could be done above instead of pulling IL ZIPs first. There are two duplicate ZIPs in the file, so we need to aggregate so we have just the unique Chicago ZIPs.
+
+```
+chzips<- read_csv('chzips.csv', col_names = TRUE )
+chzips<- chzips %>% mutate(across(everything(), as.character))
+
+chzips <- chzips %>% distinct(zip) # aggregate zips down to 59
+
+ch_debt_census<- inner_join(il_debt_census_fin, chzips, by = "zip")
+
+ch_debt_census<- ch_debt_census %>% select(1:29) #pull off first 29 columns
+```
+
+Check totals for Chicago:
+```{r}
+ch_debt_census %>%
+  summarise(xsumoffsets = sum(sumoffsets), xsumamt=sum(sumamt))
+```
+
+
+##Correlation
+We first run a correlation on two columns as an example. We then do it for all the rate and percentage columns to identify variables that are highly correlated.
+
+```{r}
+library(psych)
+
+cor(ch_debt_census$pct_black,ch_debt_census$amt_rate,use="pairwise.complete.obs") # run correlation on two variables
+
+round(cor(ch_debt_census[18:29], use="pairwise.complete.obs"),2) # run correlation on all valid variables
+```
+
+##Plots and regressions
+
+All of this looks overwhelming at first, but it's a good way to really find patterns that you can't do with descriptives.
+
+We tested various combinations of independent and dependent variables, using percent below poverty, percent black and median income as independent variables with rates of offsets and offsets amounts as dependent variables. Because pct_pov and pct_black are highly correlated, we examined them separately. The pattern was stronger with number of offsets than with offset amount, which would indicate more offsets for less money. We also looked at median income as an independent variable, but it was not as strong as either pct_pov or pct_black. 
+
+**The key values are:** <br>
+**Adjusted R square** - This explains how much of the variation in one variable is explained by another.<br> 
+**Coefficient** for the independent variable - This is the slope and tells us how much a 1 unit change changes the dependent variable. A coefficient of 4 for pct_pov would mean that for every 1 point change in pct_pov, the outcome goes up by 4 units. <br>
+**p value** - We want this to be less than .05 for the results to be considered significant.
+
+```{r echo=FALSE}
+load("jlworking.RData")
+options(scipen=999)
+
+ch_pov_model<- lm(offset_rate ~ pct_pov, data=ch_debt_census)
+plot(ch_debt_census$pct_pov, ch_debt_census$offset_rate, main="Poverty versus Offsets",
+   xlab="pct_pov", ylab="offset_rate", pch=19) 
+abline(ch_pov_model, col="red") 
+summary(ch_pov_model)
+
+ch_bl_model<- lm(offset_rate ~ pct_black, data=ch_debt_census)
+plot(ch_debt_census$pct_black, ch_debt_census$offset_rate, main="Black population versus Offsets",
+   xlab="pct_black", ylab="offset_rate", pch=19) 
+abline(ch_bl_model, col="red") 
+summary(ch_bl_model)
+
+ch_hi_model<- lm(offset_rate ~ pct_hisp, data=ch_debt_census)
+plot(ch_debt_census$pct_hisp, ch_debt_census$offset_rate, main="Hispanic population versus Offsets",
+   xlab="pct_hisp", ylab="offset_rate", pch=19) 
+abline(ch_hi_model, col="red") 
+summary(ch_hi_model)
+
+ch_mi_model<- lm(offset_rate ~ medinc, data=ch_debt_census)
+plot(ch_debt_census$medinc, ch_debt_census$offset_rate, main="Median Household Income versus Offsets",
+   xlab="medinc", ylab="offset_rate", pch=19) 
+abline(ch_mi_model, col="red") 
+summary(ch_mi_model)
+
+ch_blamt_model<- lm(amt_rate ~ pct_black, data=ch_debt_census)
+plot(ch_debt_census$pct_black, ch_debt_census$amt_rate, main="Black population versus offset amount",
+   xlab="pct_black", ylab="amt_rate", pch=19) 
+abline(ch_blamt_model, col="red") 
+summary(ch_blamt_model)
+
+ch_povamt_model<- lm(amt_rate ~ pct_pov, data=ch_debt_census)
+plot(ch_debt_census$pct_pov, ch_debt_census$amt_rate, main="Poverty versus offset amount",
+   xlab="pct_pov", ylab="amt_rate", pch=19) 
+abline(ch_povamt_model, col="red")
+(summary(ch_povamt_model))
+
+```
